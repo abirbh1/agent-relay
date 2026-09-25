@@ -51,7 +51,10 @@ jobs:
 
       - name: Start API against PostgreSQL
         run: |
-          RELAY_DATABASE_URL="$API_DATABASE_URL" nohup uv run uvicorn main:app --port 8000 > api.log 2>&1 &
+          # Run uvicorn from the venv, not via `uv run`: a background `uv run`
+          # holds the uv cache lock and blocks setup-uv's post-job cache prune.
+          RELAY_DATABASE_URL="$API_DATABASE_URL" nohup .venv/bin/uvicorn main:app --port 8000 > api.log 2>&1 &
+          echo $! > api.pid
           for _ in $(seq 30); do
             curl -fsS http://127.0.0.1:8000/ready && exit 0
             sleep 1
@@ -68,6 +71,11 @@ jobs:
       - name: Show API log
         if: failure()
         run: cat api.log || true
+
+      - name: Stop API
+        if: always()
+        run: |
+          if [ -f api.pid ]; then kill "$(cat api.pid)" 2>/dev/null || true; fi
 
   deploy:
     # Runs only when every test passed; otherwise the version already in the
