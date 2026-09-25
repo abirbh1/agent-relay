@@ -130,6 +130,9 @@ or an LLM. Those are deployment concerns rather than part of the relay protocol.
    test skips the whole job, so the version already in the cluster keeps
    running.
 
+The deploy job targets a kind cluster on your machine, so it runs only under
+act (actor `nektos/act`); on GitHub the tests run and `deploy` is skipped.
+
 Run it locally with [act](https://nektosact.com) against a kind cluster:
 
 ```bash

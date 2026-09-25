@@ -81,7 +81,9 @@ jobs:
     # Runs only when every test passed; otherwise the version already in the
     # cluster keeps serving and nothing below executes.
     needs: test
-    if: github.event_name != 'pull_request'
+    # The target is a kind cluster on the developer's machine, which only a
+    # local act run can reach; GitHub-hosted runners skip this job.
+    if: github.event_name != 'pull_request' && github.actor == 'nektos/act'
     runs-on: ubuntu-latest
     env:
       CLUSTER: agent-relay
