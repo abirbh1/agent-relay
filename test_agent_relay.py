@@ -1,19 +1,21 @@
-"""Protocol tests for the SQLite starter.
+"""Protocol tests for Agent Relay on PostgreSQL.
 
 These tests intentionally exercise storage calls from multiple threads: that
 is the closest local equivalent to several worker processes racing to claim an
-inbox.  The production guarantee comes from SQLite's BEGIN IMMEDIATE boundary,
-not from a Python lock.
+inbox.  The production guarantee comes from PostgreSQL row locks
+(``FOR UPDATE SKIP LOCKED``), not from a Python lock.
+
+Start PostgreSQL first with ``docker compose up -d postgres``.
 """
 
 from __future__ import annotations
 
 import os
 
-# Default to a scratch DB so `pytest` never resets the dev server's
-# `./agent-relay.db`. Respect an explicit RELAY_DATABASE_URL/DATABASE_URL
-# (e.g. CI pointing at PostgreSQL), but otherwise isolate tests.
-os.environ.setdefault("RELAY_DATABASE_URL", "sqlite:////tmp/agent-relay-test.db")
+# Default to the scratch `agent_relay_test` database (created by
+# docker/postgres-init.sql) so `pytest` never resets the API's `agent_relay`
+# database. Respect an explicit RELAY_DATABASE_URL, but otherwise isolate tests.
+os.environ.setdefault("RELAY_DATABASE_URL", "postgresql+psycopg://relay:relay@localhost:5432/agent_relay_test")
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -29,7 +31,7 @@ from storage import claim_one
 @pytest.fixture(autouse=True)
 def empty_database():
     # Resets whatever DB RELAY_DATABASE_URL points at. Defaults to the
-    # scratch /tmp file above; never run against a DB with data you need.
+    # scratch database above; never run against a DB with data you need.
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     yield
@@ -98,7 +100,7 @@ def test_protocol_idempotency_terminal_retry_and_auth_boundary():
         assert "claim_token" not in attempts["items"][0]
 
 
-def test_sqlite_atomic_claims_distribute_without_overlap():
+def test_atomic_claims_distribute_without_overlap():
     with TestClient(main.app) as client:
         _sender, sender_headers = register(client, "sender")
         recipient, _recipient_headers = register(client, "recipient")
@@ -157,6 +159,69 @@ def test_dashboard_is_asset_and_invalid_input_is_documented_error():
         page = client.get("/")
         assert page.status_code == 200
         assert "sessionStorage" in page.text
+        assert "<h1>Agent Relay v2</h1>" in page.text
         missing_name = client.post("/api/v1/agents", json={})
         assert missing_name.status_code == 400
         assert missing_name.json()["error"]["code"] == "invalid_input"
+
+
+def exchange_task(client) -> str:
+    """Acceptance scenario 1 over HTTP; works with TestClient or httpx.Client."""
+
+    sender, sender_headers = register(client, "alice")
+    recipient, recipient_headers = register(client, "uppercase")
+
+    sent = client.post(
+        "/api/v1/tasks",
+        json={"to": recipient["agent_id"], "input": "hello relay"},
+        headers={**sender_headers, "Idempotency-Key": "scenario-1"},
+    )
+    assert sent.status_code == 201
+    assert sent.json()["status"] == "queued"
+    task_id = sent.json()["task_id"]
+
+    claim = client.post(
+        "/api/v1/tasks/claim", json={"worker_id": "test-worker", "wait_seconds": 0}, headers=recipient_headers
+    )
+    assert claim.status_code == 200
+    claimed = claim.json()
+    assert claimed["task_id"] == task_id
+    assert claimed["from"] == sender["agent_id"]
+    assert claimed["attempt"] == 1
+    assert client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers).json()["status"] == "processing"
+
+    complete = client.post(
+        f"/api/v1/tasks/{task_id}/complete",
+        json={"claim_token": claimed["claim_token"], "output": claimed["input"].upper()},
+        headers=recipient_headers,
+    )
+    assert complete.status_code == 200
+    assert complete.json()["status"] == "completed"
+
+    result = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers).json()
+    assert result["status"] == "completed"
+    assert result["from"] == sender["agent_id"]
+    assert result["to"] == recipient["agent_id"]
+    assert result["output"] == "HELLO RELAY"
+    assert result["error"] is None
+    assert result["attempt_count"] == 1
+    assert result["finished_at"] is not None
+
+    attempts = client.get(f"/api/v1/tasks/{task_id}/attempts", headers=sender_headers)
+    assert attempts.status_code == 200
+    assert "claim_token" not in attempts.text
+
+    sent_list = client.get("/api/v1/tasks?direction=sent", headers=sender_headers).json()
+    assert [item["task_id"] for item in sent_list["items"]] == [task_id]
+    return task_id
+
+
+def test_acceptance_scenario_1_two_agents_exchange_task_and_result():
+    with TestClient(main.app) as client:
+        task_id = exchange_task(client)
+
+    with db_session() as db:
+        stored = db.get(Task, task_id)
+        assert stored.status == "completed"
+        assert stored.output == "HELLO RELAY"
+        assert db.query(Attempt).filter(Attempt.task_id == task_id).count() == 1

@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+          POSTGRES_DB: agent_relay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U relay -d agent_relay"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      # The service port is published on localhost, both on GitHub-hosted
+      # runners and under act (which runs the job on the Docker host network).
+      API_DATABASE_URL: postgresql+psycopg://relay:relay@localhost:5432/agent_relay
+      RELAY_DATABASE_URL: postgresql+psycopg://relay:relay@localhost:5432/agent_relay_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Create scratch test database
+        # The pytest fixture drops every table, so it gets its own database.
+        run: |
+          uv run python - <<'EOF'
+          import os
+          import psycopg
+          with psycopg.connect(os.environ["API_DATABASE_URL"].replace("+psycopg", ""), autocommit=True) as conn:
+              conn.execute("CREATE DATABASE agent_relay_test")
+          EOF
+
+      - name: Run starter tests
+        run: uv run pytest -q test_agent_relay.py
+
+      - name: Start API against PostgreSQL
+        run: |
+          RELAY_DATABASE_URL="$API_DATABASE_URL" nohup uv run uvicorn main:app --port 8000 > api.log 2>&1 &
+          for _ in $(seq 30); do
+            curl -fsS http://127.0.0.1:8000/ready && exit 0
+            sleep 1
+          done
+          cat api.log
+          exit 1
+
+      - name: Run integration test against the live API
+        env:
+          RELAY_API_URL: http://127.0.0.1:8000
+          RELAY_STACK_DATABASE_URL: ${{ env.API_DATABASE_URL }}
+        run: uv run pytest -q -rs test_compose_integration.py
+
+      - name: Show API log
+        if: failure()
+        run: cat api.log || true
+
+  deploy:
+    # Runs only when every test passed; otherwise the version already in the
+    # cluster keeps serving and nothing below executes.
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      CLUSTER: agent-relay
+      NAMESPACE: agent-relay
+      KIND_VERSION: v0.33.0
+      KUBECTL_VERSION: v1.37.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute unique image tag
+        id: tag
+        run: |
+          tag="$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA::7}"
+          echo "image=agent-relay:$tag" >> "$GITHUB_OUTPUT"
+          echo "Image: agent-relay:$tag"
+
+      - name: Install kind and kubectl
+        run: |
+          arch="$(uname -m)"; case "$arch" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; esac
+          mkdir -p "$HOME/bin"
+          curl -fsSLo "$HOME/bin/kind" "https://kind.sigs.k8s.io/dl/$KIND_VERSION/kind-linux-$arch"
+          curl -fsSLo "$HOME/bin/kubectl" "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/$arch/kubectl"
+          chmod +x "$HOME/bin/kind" "$HOME/bin/kubectl"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Connect to the kind cluster
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          test -n "$KUBECONFIG_B64" || { echo "KUBECONFIG_B64 secret is missing"; exit 1; }
+          mkdir -p "$HOME/.kube"
+          echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          kubectl cluster-info
+
+      - name: Build image
+        run: docker build -t "${{ steps.tag.outputs.image }}" .
+
+      - name: Load image into kind
+        run: kind load docker-image "${{ steps.tag.outputs.image }}" --name "$CLUSTER"
+
+      - name: Deploy
+        run: |
+          kubectl kustomize k8s/ \
+            | sed "s#image: agent-relay:local#image: ${{ steps.tag.outputs.image }}#" \
+            | kubectl apply -f -
+          kubectl -n "$NAMESPACE" rollout status statefulset/postgres --timeout=180s
+
+      - name: Wait for rollout
+        run: |
+          if ! kubectl -n "$NAMESPACE" rollout status deployment/agent-relay --timeout=180s; then
+            kubectl -n "$NAMESPACE" get pods
+            kubectl -n "$NAMESPACE" rollout undo deployment/agent-relay
+            kubectl -n "$NAMESPACE" rollout status deployment/agent-relay --timeout=180s
+            exit 1
+          fi
+          kubectl -n "$NAMESPACE" get deployment agent-relay \
+            -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+
+      - name: Smoke test deployed dashboard
+        id: smoke
+        run: |
+          # Let kubectl pick a free local port; fixed ports can collide with
+          # other listeners on the (act) host network.
+          kubectl -n "$NAMESPACE" port-forward svc/agent-relay :80 > pf.log 2>&1 &
+          for _ in $(seq 20); do grep -q "Forwarding from 127.0.0.1" pf.log && break; sleep 1; done
+          port="$(sed -n 's/^Forwarding from 127.0.0.1:\([0-9]*\).*/\1/p' pf.log | head -1)"
+          test -n "$port" || { cat pf.log; exit 1; }
+          curl -fsS "http://127.0.0.1:$port/ready"; echo
+          curl -fsS "http://127.0.0.1:$port/" | grep -o '<h1>[^<]*</h1>'
+
+      - name: Roll back if the new version fails its smoke test
+        if: failure() && steps.smoke.outcome == 'failure'
+        run: |
+          kubectl -n "$NAMESPACE" rollout undo deployment/agent-relay
+          kubectl -n "$NAMESPACE" rollout status deployment/agent-relay --timeout=180s
